@@ -3,11 +3,17 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use ratatui::{
-    crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
-    layout::{Constraint, Flex, Layout, Rect},
+    crossterm::{
+        event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind},
+        execute,
+    },
+    layout::{Constraint, Flex, Layout, Margin, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, BorderType, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState},
+    widgets::{
+        Block, BorderType, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Scrollbar, ScrollbarOrientation,
+        ScrollbarState, Table, TableState,
+    },
     DefaultTerminal, Frame,
 };
 
@@ -75,7 +81,9 @@ pub fn run(entries: Vec<Entry>, filters: Filters, out: PathBuf, layout: OutLayou
     app.refilter();
 
     let mut terminal = ratatui::init();
+    let _ = execute!(std::io::stdout(), EnableMouseCapture);
     let res = app.run(&mut terminal);
+    let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     res
 }
@@ -99,10 +107,10 @@ impl App {
     fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         while !self.quit {
             terminal.draw(|f| self.draw(f))?;
-            if let Event::Key(k) = event::read()? {
-                if k.kind == KeyEventKind::Press {
-                    self.on_key(k);
-                }
+            match event::read()? {
+                Event::Key(k) if k.kind == KeyEventKind::Press => self.on_key(k),
+                Event::Mouse(m) => self.on_mouse(m),
+                _ => {}
             }
         }
         Ok(())
@@ -170,6 +178,22 @@ impl App {
     }
 
     // ---------- input ----------
+
+    fn on_mouse(&mut self, m: MouseEvent) {
+        let delta = match m.kind {
+            MouseEventKind::ScrollDown => SCROLL_STEP,
+            MouseEventKind::ScrollUp => -SCROLL_STEP,
+            _ => return,
+        };
+        match &mut self.mode {
+            Mode::Normal => {
+                self.message = None;
+                self.move_by(delta);
+            }
+            Mode::Pick { items, state, .. } => pick_move(state, items.len(), delta),
+            _ => {}
+        }
+    }
 
     fn on_key(&mut self, k: KeyEvent) {
         if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c') {
@@ -328,8 +352,12 @@ impl App {
         let cur = state.selected().unwrap_or(0);
         match k.code {
             KeyCode::Esc | KeyCode::Char('q') => return Mode::Normal,
-            KeyCode::Down | KeyCode::Char('j') => state.select(Some((cur + 1).min(items.len().saturating_sub(1)))),
-            KeyCode::Up | KeyCode::Char('k') => state.select(Some(cur.saturating_sub(1))),
+            KeyCode::Down | KeyCode::Char('j') => pick_move(&mut state, items.len(), 1),
+            KeyCode::Up | KeyCode::Char('k') => pick_move(&mut state, items.len(), -1),
+            KeyCode::PageDown => pick_move(&mut state, items.len(), 10),
+            KeyCode::PageUp => pick_move(&mut state, items.len(), -10),
+            KeyCode::Home | KeyCode::Char('g') => pick_move(&mut state, items.len(), isize::MIN / 2),
+            KeyCode::End | KeyCode::Char('G') => pick_move(&mut state, items.len(), isize::MAX / 2),
             KeyCode::Char(' ') => {
                 if let Some(it) = items.get_mut(cur) {
                     it.checked = !it.checked;
@@ -487,6 +515,9 @@ impl App {
                 .title(format!(" Files {pos}/{} ", self.visible.len())),
         );
         f.render_stateful_widget(table, area, &mut self.table);
+        // Rows start below the top border and the header line.
+        let rows_area = Rect { y: area.y + 2, height: area.height.saturating_sub(3), ..area };
+        scrollbar(f, rows_area, self.visible.len(), self.table.selected().unwrap_or(0));
     }
 
     fn draw_footer(&self, f: &mut Frame, area: Rect) {
@@ -532,6 +563,29 @@ impl App {
     }
 }
 
+const SCROLL_STEP: isize = 3;
+
+fn pick_move(state: &mut ListState, len: usize, delta: isize) {
+    if len == 0 {
+        return;
+    }
+    let cur = state.selected().unwrap_or(0) as isize;
+    state.select(Some((cur + delta).clamp(0, len as isize - 1) as usize));
+}
+
+/// Draws a vertical scrollbar on the right border of `area` when content overflows it.
+fn scrollbar(f: &mut Frame, area: Rect, len: usize, pos: usize) {
+    if len <= area.height as usize {
+        return;
+    }
+    let mut st = ScrollbarState::new(len).position(pos);
+    f.render_stateful_widget(
+        Scrollbar::new(ScrollbarOrientation::VerticalRight).begin_symbol(None).end_symbol(None),
+        area,
+        &mut st,
+    );
+}
+
 fn key(k: &str) -> Span<'static> {
     Span::from(k.to_string()).bold().cyan()
 }
@@ -571,11 +625,12 @@ fn draw_pick(f: &mut Frame, area: Rect, kind: PickKind, items: &[PickItem], stat
     .highlight_style(Style::new().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
     .white();
     f.render_stateful_widget(list, rect, state);
+    scrollbar(f, rect.inner(Margin::new(0, 1)), items.len(), state.selected().unwrap_or(0));
 }
 
 fn draw_help(f: &mut Frame, area: Rect) {
     let rows = [
-        ("↑ ↓ / j k", "move   (PgUp/PgDn, g/G for top/bottom)"),
+        ("↑ ↓ / j k", "move   (PgUp/PgDn, g/G top/bottom, mouse wheel)"),
         ("space", "select / unselect file"),
         ("a", "select all visible (again = unselect)"),
         ("c", "clear selection"),
